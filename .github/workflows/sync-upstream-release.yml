@@ -11,8 +11,7 @@ on:
         type: string
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: sync-upstream-release
@@ -22,17 +21,26 @@ jobs:
   sync:
     if: github.repository == 'a16z-data-analytics/databricks-genie-workbench'
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Check sync token
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "UPSTREAM_SYNC_TOKEN is not configured" >&2
+            exit 1
+          fi
 
       # This write-capable workflow only performs Git operations. Upstream code
       # is executed later by the read-only pull-request validation workflow.
       - name: Resolve release
         id: release
         env:
-          GH_TOKEN: ${{ github.token }}
           REQUESTED_RELEASE: ${{ inputs.release }}
         run: |
           set -euo pipefail
@@ -61,7 +69,6 @@ jobs:
         if: steps.release.outputs.needed == 'true'
         env:
           AUTO_MERGE: ${{ vars.AUTO_MERGE_UPSTREAM_RELEASES }}
-          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_SHA: ${{ steps.release.outputs.sha }}
         run: |
