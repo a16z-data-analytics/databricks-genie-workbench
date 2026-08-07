@@ -1,0 +1,94 @@
+name: Sync upstream release
+
+on:
+  schedule:
+    - cron: "17 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Upstream release tag (defaults to latest)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'a16z-data-analytics/databricks-genie-workbench'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Check sync token
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "UPSTREAM_SYNC_TOKEN is not configured" >&2
+            exit 1
+          fi
+
+      # This write-capable workflow only performs Git operations. Upstream code
+      # is executed later by the read-only pull-request validation workflow.
+      - name: Resolve release
+        id: release
+        env:
+          REQUESTED_RELEASE: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_RELEASE"
+          if [[ -z "$tag" ]]; then
+            tag="$(gh api repos/databricks-solutions/databricks-genie-workbench/releases/latest --jq .tag_name)"
+          fi
+          if [[ ! "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported release tag: $tag" >&2
+            exit 1
+          fi
+
+          git remote add upstream https://github.com/databricks-solutions/databricks-genie-workbench.git
+          git fetch upstream "refs/tags/$tag:refs/tags/$tag" --force
+          sha="$(git rev-parse "refs/tags/$tag^{commit}")"
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$sha" origin/main; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open release update
+        if: steps.release.outputs.needed == 'true'
+        env:
+          AUTO_MERGE: ${{ vars.AUTO_MERGE_UPSTREAM_RELEASES }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          branch="automation/upstream-$RELEASE_TAG"
+          git config user.name "a16z-data-analytics[bot]"
+          git config user.email "a16z-data-analytics[bot]@users.noreply.github.com"
+          git switch --force-create "$branch" origin/main
+          git merge --no-edit "$RELEASE_SHA"
+          git push --force-with-lease origin "HEAD:refs/heads/$branch"
+
+          pr="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "$pr" ]]; then
+            pr="$(gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "Update Genie Workbench to $RELEASE_TAG" \
+              --body "Automated sync of upstream release [${RELEASE_TAG}](https://github.com/databricks-solutions/databricks-genie-workbench/releases/tag/${RELEASE_TAG}).")"
+          fi
+
+          if [[ "$AUTO_MERGE" == "true" ]] && ! gh pr merge "$pr" --auto --merge; then
+            echo "::warning::PR $pr is ready, but auto-merge could not be enabled."
+          fi
