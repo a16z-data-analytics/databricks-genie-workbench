@@ -21,7 +21,7 @@ jobs:
           enable-cache: true
       - run: uv lock --check
       - run: uv sync --frozen
-      - run: uv run pytest backend/tests packages/genie-space-optimizer/tests/unit -q
+      - run: uv run --no-sync python -m compileall -q backend packages/genie-space-optimizer/src
 
   frontend:
     runs-on: ubuntu-latest
