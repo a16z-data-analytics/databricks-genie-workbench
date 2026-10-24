@@ -60,21 +60,22 @@ _preflight_check_tools() {
         missing+=("Python 3.11+ — https://python.org/")
     fi
 
-    # node presence + version supported by Vite
+    # Patched Node.js release lines compatible with Vite.
     if command -v node &>/dev/null; then
         local node_version
         node_version=$(node --version 2>/dev/null || echo "unknown")
         if node -e '
-const [major, minor] = process.versions.node.split(".").map(Number);
-const supported = (major === 20 && minor >= 19) || (major === 22 && minor >= 12) || major > 22;
+const [major, minor, patch] = process.versions.node.split(".").map(Number);
+const minimum = {22: [23, 4], 24: [22, 1], 26: [12, 1]}[major];
+const supported = minimum && (minor > minimum[0] || (minor === minimum[0] && patch >= minimum[1]));
 process.exit(supported ? 0 : 1);
 ' 2>/dev/null; then
             echo -e "  ${GREEN}✓${NC} Node.js $node_version"
         else
-            issues+=("Node.js $node_version is not supported by the frontend toolchain — Vite requires ^20.19.0 or >=22.12.0")
+            issues+=("Node.js $node_version requires a security update — use 22.23.4+, 24.22.1+, or 26.12.1+")
         fi
     else
-        missing+=("Node.js ^20.19.0 or >=22.12.0 — https://nodejs.org/")
+        missing+=("Node.js 22.23.4+, 24.22.1+, or 26.12.1+ — https://nodejs.org/")
     fi
 
     # npm
@@ -86,7 +87,13 @@ process.exit(supported ? 0 : 1);
 
     # uv
     if command -v uv &>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} uv ($(uv --version 2>/dev/null))"
+        local uv_version
+        uv_version=$(uv --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+        if [ -n "$uv_version" ] && [ "$(printf '%s\n%s\n' '0.13.5' "$uv_version" | sort -V | head -1)" = '0.13.5' ]; then
+            echo -e "  ${GREEN}✓${NC} uv $uv_version"
+        else
+            issues+=("uv ${uv_version:-unknown} requires a security update — use 0.13.5 or later")
+        fi
     else
         missing+=("uv — curl -LsSf https://astral.sh/uv/install.sh | sh  (or: brew install uv)")
     fi

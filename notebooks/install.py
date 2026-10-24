@@ -13,7 +13,7 @@
 # MAGIC **Optional:** Lakebase Autoscaling is recommended for persistent app state. Set `lakebase_mode` to `skip` only when ephemeral in-memory state is acceptable.
 
 # COMMAND ----------
-# MAGIC %pip install databricks-sdk==0.117.0 pyyaml==6.0.3 "psycopg[binary]==3.3.3" hatchling==1.29.0 uv-dynamic-versioning==0.13.0
+# MAGIC %pip install certifi==2026.10.19 databricks-sdk==0.117.0 pyyaml==6.0.3 "psycopg[binary]==3.3.3" hatchling==1.29.0 uv-dynamic-versioning==0.13.0
 
 # COMMAND ----------
 dbutils.library.restartPython()
