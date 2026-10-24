@@ -19,6 +19,7 @@ concurrency:
 jobs:
   build:
     name: Build Docusaurus site
+    if: github.repository == 'databricks-solutions/databricks-genie-workbench'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -41,6 +42,7 @@ jobs:
   deploy:
     name: Deploy to GitHub Pages
     needs: build
+    if: github.repository == 'databricks-solutions/databricks-genie-workbench'
     runs-on:
       group: databricks-solutions-protected-runner-group
       labels: linux-ubuntu-latest
