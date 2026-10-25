@@ -13,6 +13,8 @@ Usage:
 
 import argparse
 
+import certifi
+
 
 def _get_client(profile: str):
     """Create a WorkspaceClient from a CLI profile."""
@@ -192,7 +194,8 @@ def _grant_permissions(w, project_name: str, sp_client_id: str, endpoint_name: s
     try:
         conn = psycopg.connect(
             host=host, port=5432, dbname="databricks_postgres",
-            user=deployer_user, password=token, sslmode="require",
+            user=deployer_user, password=token,
+            sslmode="verify-full", sslrootcert=certifi.where(),
         )
         conn.autocommit = True
 
