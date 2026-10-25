@@ -56,6 +56,11 @@ def set_obo_user_token(token: str) -> None:
         # Prevent the SDK from reading env vars that would override the token
         client_id=None,
         client_secret=None,  # gitleaks:allow
+        # Genie Agent creation can take longer than the SDK's 60s default read
+        # timeout (large serialized_space configs, warehouse binding). Widen it
+        # so slow-but-successful creates return their response instead of
+        # raising a read-timeout that used to trigger duplicate-creation retries.
+        http_timeout_seconds=300,
     )
     client = WorkspaceClient(config=cfg, product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
     _obo_client.set(client)
@@ -72,7 +77,15 @@ def _get_default_client() -> WorkspaceClient:
     global _client, _auth_logged
 
     if _client is None:
-        _client = WorkspaceClient(product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
+        # Widen the read timeout to match the OBO client. Genie Space creation
+        # can fall back to the SP on scope errors, and create can exceed the
+        # SDK's 60s default read timeout on large configs — without this, an SP
+        # create would hit the same timeout that drove the duplicate-space bug.
+        _client = WorkspaceClient(
+            config=Config(http_timeout_seconds=300),
+            product=PRODUCT_NAME,
+            product_version=PRODUCT_VERSION,
+        )
 
         if not _auth_logged:
             logger.info("=== Databricks SDK Authentication ===")
@@ -112,6 +125,19 @@ def get_workspace_client() -> WorkspaceClient:
     if obo is not None:
         return obo
     return _get_default_client()
+
+
+def require_obo_workspace_client() -> WorkspaceClient:
+    """Return only the request's user-authorized client.
+
+    Unlike :func:`get_workspace_client`, this function never falls back to the
+    app service principal. Use it for reads whose visibility is explicitly
+    scoped to the current user's permissions.
+    """
+    obo = _obo_client.get()
+    if obo is None:
+        raise RuntimeError("This operation requires user authorization")
+    return obo
 
 
 def get_service_principal_client() -> WorkspaceClient:

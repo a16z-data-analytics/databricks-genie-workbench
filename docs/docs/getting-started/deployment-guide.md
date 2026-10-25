@@ -22,14 +22,12 @@ A Databricks workspace with:
 - A SQL Warehouse (Serverless recommended)
 - A Unity Catalog with CREATE SCHEMA permission
 - Lakebase Autoscaling available (optional but recommended for persistent scan history, starred agents, and agent sessions)
-- MLflow Prompt Registry enabled (required for Auto-Optimize judge prompts)
 - Databricks Foundation Model APIs enabled for the curated Create Agent and Auto-Optimize model list
 
 ### Enable required preview features
 
 Before installing, enable these on the Databricks **Previews** page (workspace admins manage preview toggles):
 
-- **Managed MLflow Prompt Registry** (Beta) — required for Auto-Optimize judge prompts
 - **Databricks Apps – On-Behalf-Of User Authorization** (Public Preview)
 
 :::note
@@ -264,7 +262,6 @@ All dependencies are pinned to exact versions with integrity hashes. Lock files 
 |------|--------|-------------|
 | `uv.lock` | Workspace-wide Python transitive deps (root + GSO) | SHA256 hashes |
 | `frontend/package-lock.json` | Frontend npm deps | SHA-512 integrity |
-| `packages/genie-space-optimizer/package-lock.json` | GSO UI npm deps | SHA-512 integrity |
 
 ### Updating Python dependencies
 
@@ -273,12 +270,21 @@ uv lock --upgrade-package <package-name>
 uv export --frozen --no-dev --no-hashes --format requirements-txt \
   | grep -v "^-e " > requirements.txt
 echo "-e ./packages/genie-space-optimizer" >> requirements.txt
-git add uv.lock requirements.txt
+python scripts/export_gso_job_requirements.py
+git add uv.lock requirements.txt packages/genie-space-optimizer/requirements-job.txt
 ```
 
 :::warning
-Do not edit `requirements.txt` manually. It is generated from `uv.lock`.
+Do not edit `requirements.txt` or `requirements-job.txt` manually. Both are generated from `uv.lock`.
 :::
+
+`requirements-job.txt` pins the GSO optimization job's transitive dependencies to the
+versions in `uv.lock`. Every job environment installs it next to the GSO wheel, so job
+runs don't re-resolve against the live package index. It leaves out packages the
+serverless base environment already ships (listed in
+`packages/genie-space-optimizer/serverless-env-v4-base-packages.txt`), so the job
+never replaces base-image packages. Refresh that snapshot whenever the job's
+serverless `environment_version` changes.
 
 ### Updating npm dependencies
 

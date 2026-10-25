@@ -20,14 +20,70 @@ from .workspace_source import (
 )
 
 
+# GSO v2 linear 4-task DAG. This MIRRORS the package bundle job at
+# packages/genie-space-optimizer/databricks.yml (the validated source of truth,
+# guarded by tests/unit/test_phase7_job_dag.py): same task keys, order,
+# entrypoints, linear dependencies, and per-task base_parameters. There is NO
+# condition task and NO `deploy` task (deploy is out of scope — D7). Each entry
+# is (task_key, notebook_stem, depends_on, base_param_keys). `base_param_keys`
+# lists the job parameters passed to that task as base_parameters (every task
+# reads job params + durable Delta state by run_id — no task-value plumbing, D9).
+#
+# `llm_model` is a Workbench-specific extra beyond the package bundle's params:
+# the local-terminal deploy passes it via `--var llm_model` (deploy.sh) and the
+# notebook installer defaults it to cfg.llm_model, so the operator-selected
+# serving endpoint reaches each task (every v2 entrypoint honors the llm_model
+# widget). See build_job_settings for the parameter declarations.
 TASKS = [
-    ("preflight", "run_preflight", None),
-    ("baseline_eval", "run_baseline", "preflight"),
-    ("enrichment", "run_enrichment", "baseline_eval"),
-    ("lever_loop", "run_lever_loop", "enrichment"),
-    ("finalize", "run_finalize", "lever_loop"),
+    (
+        "intake_and_snapshot",
+        "run_intake_and_snapshot",
+        None,
+        [
+            "run_id", "space_id", "domain", "catalog", "schema", "apply_mode",
+            "levers", "max_attempts", "target_accuracy",
+            "benchmark_repair_max_tries", "triggered_by",
+            "benchmark_policy", "warehouse_id", "workload_warehouse_ids", "llm_model",
+        ],
+    ),
+    (
+        "benchmark_qc_and_repair",
+        "run_benchmark_qc_and_repair",
+        "intake_and_snapshot",
+        [
+            "run_id", "space_id", "domain", "catalog", "schema", "apply_mode",
+            "benchmark_repair_max_tries", "warehouse_id", "llm_model",
+            "benchmark_policy",
+        ],
+    ),
+    (
+        "optimize",
+        "run_optimize",
+        "benchmark_qc_and_repair",
+        [
+            "run_id", "space_id", "domain", "catalog", "schema", "apply_mode",
+            "levers", "max_attempts", "target_accuracy",
+            "benchmark_policy", "warehouse_id", "llm_model",
+        ],
+    ),
+    (
+        "publish_and_audit",
+        "run_publish_and_audit",
+        "optimize",
+        [
+            "run_id", "space_id", "domain", "catalog", "schema", "apply_mode",
+            "target_accuracy", "max_attempts", "warehouse_id", "llm_model",
+            "benchmark_policy",
+        ],
+    ),
 ]
 
+# Declared job parameters + defaults. Mirrors the package bundle's 4-task param
+# set: bounded patch/eval budget (max_attempts), stop-early target
+# (target_accuracy), and benchmark repair bound (benchmark_repair_max_tries).
+# `experiment_name` (MLflow decommissioned — Phase 5) and `deploy_target`
+# (deploy out of scope — D7) are dropped. `llm_model` is the Workbench-specific extra (see TASKS above);
+# its default is overridden with cfg.llm_model in build_job_settings.
 JOB_PARAMETERS = {
     "run_id": "",
     "space_id": "",
@@ -36,11 +92,13 @@ JOB_PARAMETERS = {
     "schema": "",
     "apply_mode": "genie_config",
     "levers": "[1,2,3,4,5,6]",
-    "max_iterations": "5",
+    "max_attempts": "3",
+    "target_accuracy": "0.90",
+    "benchmark_repair_max_tries": "3",
+    "benchmark_policy": "repair_allowed",
     "triggered_by": "",
-    "experiment_name": "",
-    "deploy_target": "",
     "warehouse_id": "",
+    "workload_warehouse_ids": "[]",
     "llm_model": "",
 }
 
@@ -61,7 +119,7 @@ def upload_job_notebooks(w, cfg: InstallConfig, deployer_user: str) -> str:
 
     notebooks_path = f"{default_gso_path(deployer_user, cfg.app_name)}/jobs"
     mkdirs(w, notebooks_path)
-    for _, notebook_stem, _ in TASKS:
+    for _task_key, notebook_stem, _depends_on, _base_param_keys in TASKS:
         upload_source_notebook(w, jobs_dir / f"{notebook_stem}.py", f"{notebooks_path}/{notebook_stem}")
     return notebooks_path
 
@@ -101,6 +159,17 @@ def build_gso_wheel(repo_root: Path) -> Path:
         raise
 
 
+def _upload_artifact(w, local_path: Path, dest_path: str) -> None:
+    if Path(dest_path).is_absolute() and Path(dest_path).parent.exists():
+        Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(local_path, dest_path)
+    elif hasattr(w, "files"):
+        with local_path.open("rb") as f:
+            w.files.upload(dest_path, f, overwrite=True)
+    else:
+        write_workspace_file(w, dest_path, local_path.read_bytes())
+
+
 def upload_gso_wheel(w, cfg: InstallConfig) -> str:
     repo_root = Path(cfg.repo_root or "").resolve()
     wheel_path = (
@@ -109,68 +178,68 @@ def upload_gso_wheel(w, cfg: InstallConfig) -> str:
     )
     built = build_gso_wheel(repo_root)
     try:
-        if Path(wheel_path).is_absolute() and Path(wheel_path).parent.exists():
-            Path(wheel_path).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(built, wheel_path)
-        elif hasattr(w, "files"):
-            with built.open("rb") as f:
-                w.files.upload(wheel_path, f, overwrite=True)
-        else:
-            write_workspace_file(w, wheel_path, built.read_bytes())
+        _upload_artifact(w, built, wheel_path)
     finally:
         shutil.rmtree(built.parent, ignore_errors=True)
     return wheel_path
 
 
-def _task_payload(task_key: str, notebook_stem: str, depends_on: str | None, notebooks_path: str) -> dict[str, Any]:
+def upload_gso_requirements(w, cfg: InstallConfig, wheel_path: str) -> str:
+    """Upload the locked job requirements next to the wheel.
+
+    The wheel only pins direct dependencies; without these locked transitive
+    pins each run re-resolves against the live index and can break when an
+    upstream release makes the dependency tree unsatisfiable.
+    """
+    local = Path(cfg.repo_root or "").resolve() / "packages" / "genie-space-optimizer" / "requirements-job.txt"
+    if not local.exists():
+        raise FileNotFoundError(f"GSO job requirements not found: {local}")
+    requirements_path = f"{wheel_path.rsplit('/', 1)[0]}/genie_space_optimizer-requirements-job.txt"
+    _upload_artifact(w, local, requirements_path)
+    return requirements_path
+
+
+def _task_payload(
+    task_key: str,
+    notebook_stem: str,
+    depends_on: str | None,
+    base_param_keys: list[str],
+    notebooks_path: str,
+) -> dict[str, Any]:
     task: dict[str, Any] = {
         "task_key": task_key,
         "notebook_task": {
             "notebook_path": f"{notebooks_path}/{notebook_stem}",
             "source": "WORKSPACE",
             "base_parameters": {
-                "llm_model": "{{job.parameters.llm_model}}",
+                key: f"{{{{job.parameters.{key}}}}}" for key in base_param_keys
             },
         },
         "environment_key": "default",
-        "timeout_seconds": 7200,
+        "timeout_seconds": 14400,
         "max_retries": 0,
     }
     if depends_on:
         task["depends_on"] = [{"task_key": depends_on}]
-    if task_key == "preflight":
-        task["notebook_task"]["base_parameters"].update({
-            "run_id": "{{job.parameters.run_id}}",
-            "space_id": "{{job.parameters.space_id}}",
-            "domain": "{{job.parameters.domain}}",
-            "catalog": "{{job.parameters.catalog}}",
-            "schema": "{{job.parameters.schema}}",
-            "apply_mode": "{{job.parameters.apply_mode}}",
-            "levers": "{{job.parameters.levers}}",
-            "max_iterations": "{{job.parameters.max_iterations}}",
-            "experiment_name": "{{job.parameters.experiment_name}}",
-            "deploy_target": "{{job.parameters.deploy_target}}",
-            "warehouse_id": "{{job.parameters.warehouse_id}}",
-            "llm_model": "{{job.parameters.llm_model}}",
-        })
     return task
 
 
-def build_job_settings(cfg: InstallConfig, notebooks_path: str, wheel_path: str) -> dict[str, Any]:
+def build_job_settings(
+    cfg: InstallConfig,
+    notebooks_path: str,
+    wheel_path: str,
+    requirements_path: str,
+) -> dict[str, Any]:
     cfg = cfg.normalized()
     tasks = [_task_payload(*task, notebooks_path) for task in TASKS]
-    tasks.append(
-        {
-            "task_key": "deploy",
-            "depends_on": [{"task_key": "finalize"}],
-            "condition_task": {"op": "EQUAL_TO", "left": "deploy", "right": "disabled"},
-        }
-    )
     return {
         "name": cfg.gso_job_name,
         "description": (
-            "Persistent DAG optimization runner managed by Genie Workbench "
-            "(preflight -> baseline_eval -> enrichment -> lever_loop -> finalize -> deploy)."
+            "GSO v2 bounded hill-climbing runner managed by Genie Workbench "
+            "(intake_and_snapshot -> benchmark_qc_and_repair -> "
+            "optimize -> publish_and_audit). "
+            "Linear 4-task serverless DAG; baseline eval and the hill-climb run "
+            "in-process inside optimize through the native Benchmark API."
         ),
         "max_concurrent_runs": 20,
         "queue": {"enabled": True},
@@ -192,7 +261,7 @@ def build_job_settings(cfg: InstallConfig, notebooks_path: str, wheel_path: str)
                 "environment_key": "default",
                 "spec": {
                     "environment_version": "4",
-                    "dependencies": [wheel_path],
+                    "dependencies": [f"-r {requirements_path}", wheel_path],
                 },
             }
         ],
@@ -292,7 +361,8 @@ def ensure_gso_job(w, cfg: InstallConfig, app_sp_client_id: str, deployer_user: 
     cfg = cfg.normalized()
     notebooks_path = upload_job_notebooks(w, cfg, deployer_user)
     wheel_path = upload_gso_wheel(w, cfg)
-    settings = build_job_settings(cfg, notebooks_path, wheel_path)
+    requirements_path = upload_gso_requirements(w, cfg, wheel_path)
+    settings = build_job_settings(cfg, notebooks_path, wheel_path, requirements_path)
     job_id = upsert_job(w, settings)
     set_job_permissions(w, job_id, deployer_user, app_sp_client_id)
     grant_directory_permissions(w, notebooks_path, app_sp_client_id)

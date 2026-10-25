@@ -12,6 +12,7 @@ from backend.services.create_agent_tools import (
     _base_col_type,
     _enum_value_upper,
     _generate_config,
+    _present_plan,
     _reconcile_metric_view_sources,
     _validate_config,
     _TYPE_HINT_MAP,
@@ -227,6 +228,19 @@ class TestMetricViewClassification:
         assert data_sources["tables"] == []
         assert [mv["identifier"] for mv in data_sources["metric_views"]] == ["cat.sch.mv_churn_risk"]
 
+    def test_generate_config_emits_ui_style_snippets_without_aliases(self):
+        result = _generate_config(
+            tables=[{"identifier": "cat.sch.sales"}],
+            measures=[{"display_name": "Total Revenue", "sql": "SUM(sales.revenue)"}],
+            expressions=[{"display_name": "Order Year", "sql": "YEAR(sales.order_date)"}],
+        )
+
+        snippets = result["config"]["instructions"]["sql_snippets"]
+        assert snippets["measures"][0]["display_name"] == "Total Revenue"
+        assert snippets["expressions"][0]["display_name"] == "Order Year"
+        assert "alias" not in snippets["measures"][0]
+        assert "alias" not in snippets["expressions"][0]
+
     def test_validate_detects_cross_section_column_duplicates_when_not_reconciled(self):
         config = {
             "version": 2,
@@ -282,51 +296,67 @@ class TestUpdateConfigAddMeasure:
         assert measures[0]["sql"] == ["SUM(revenue)"]
         assert len(measures[0]["id"]) == 32  # hex ID
 
-    def test_skips_measure_without_alias(self):
+    def test_adds_measure_without_alias(self):
         cfg = _empty_config()
         result = _update_config(
             [{"action": "add_measure", "display_name": "Total Revenue", "sql": "SUM(revenue)"}],
             config=cfg,
         )
         measures = result["config"].get("instructions", {}).get("sql_snippets", {}).get("measures", [])
-        assert len(measures) == 0
-        assert any("Skipped" in a for a in result["applied"])
+        assert len(measures) == 1
+        assert measures[0]["display_name"] == "Total Revenue"
+        assert "alias" not in measures[0]
 
     def test_skips_measure_without_sql(self):
         cfg = _empty_config()
         result = _update_config(
-            [{"action": "add_measure", "alias": "total_rev"}],
+            [{"action": "add_measure", "display_name": "Total Revenue"}],
             config=cfg,
         )
         measures = result["config"].get("instructions", {}).get("sql_snippets", {}).get("measures", [])
         assert len(measures) == 0
 
-    def test_display_name_optional(self):
+    def test_skips_measure_without_display_name(self):
         cfg = _empty_config()
         result = _update_config(
             [{"action": "add_measure", "alias": "total_rev", "sql": "SUM(revenue)"}],
             config=cfg,
         )
-        measures = result["config"]["instructions"]["sql_snippets"]["measures"]
-        assert len(measures) == 1
-        assert "display_name" not in measures[0]
+        measures = result["config"].get("instructions", {}).get("sql_snippets", {}).get("measures", [])
+        assert len(measures) == 0
+        assert any("display_name and sql required" in a for a in result["applied"])
 
 
 class TestUpdateConfigAddExpression:
     def test_adds_expression_with_alias(self):
         cfg = _empty_config()
         result = _update_config(
-            [{"action": "add_expression", "alias": "profit_margin", "sql": "(revenue - cost) / revenue"}],
+            [{
+                "action": "add_expression",
+                "alias": "profit_margin",
+                "display_name": "Profit Margin",
+                "sql": "(revenue - cost) / revenue",
+            }],
             config=cfg,
         )
         exprs = result["config"]["instructions"]["sql_snippets"]["expressions"]
         assert len(exprs) == 1
         assert exprs[0]["alias"] == "profit_margin"
 
-    def test_skips_expression_without_alias(self):
+    def test_adds_expression_without_alias(self):
         cfg = _empty_config()
         result = _update_config(
-            [{"action": "add_expression", "sql": "SUM(x)"}],
+            [{"action": "add_expression", "display_name": "Total X", "sql": "SUM(x)"}],
+            config=cfg,
+        )
+        exprs = result["config"].get("instructions", {}).get("sql_snippets", {}).get("expressions", [])
+        assert len(exprs) == 1
+        assert "alias" not in exprs[0]
+
+    def test_skips_expression_without_display_name(self):
+        cfg = _empty_config()
+        result = _update_config(
+            [{"action": "add_expression", "alias": "total_x", "sql": "SUM(x)"}],
             config=cfg,
         )
         exprs = result["config"].get("instructions", {}).get("sql_snippets", {}).get("expressions", [])
@@ -353,3 +383,101 @@ class TestUpdateConfigAddFilter:
         )
         filters = result["config"]["instructions"]["sql_snippets"]["filters"]
         assert filters[0]["sql"] == ["status = 'active'"]
+
+
+class TestUpdateSpaceDescription:
+    """_update_space PATCHes the top-level description field when provided."""
+
+    def _mock_client(self, monkeypatch, bodies):
+        class FakeAPI:
+            def do(self, method, path, body=None, **kwargs):
+                bodies.append({"method": method, "path": path, "body": body})
+                return {}
+
+        class FakeClient:
+            api_client = FakeAPI()
+
+        monkeypatch.setattr("backend.services.auth.get_workspace_client", lambda: FakeClient())
+        monkeypatch.setattr("backend.services.auth.get_databricks_host", lambda: "https://example.com")
+        monkeypatch.setattr("backend.services.create_agent_tools.get_sql_warehouse_id", lambda: None)
+
+    def test_description_included_when_provided(self, monkeypatch):
+        from backend.services.create_agent_tools import _update_space
+
+        bodies = []
+        self._mock_client(monkeypatch, bodies)
+
+        result = _update_space("space1", description="Answers revenue questions.")
+
+        assert result["success"] is True
+        assert bodies[0]["method"] == "PATCH"
+        assert bodies[0]["body"]["description"] == "Answers revenue questions."
+        assert "serialized_space" not in bodies[0]["body"]
+
+    def test_description_omitted_when_not_provided(self, monkeypatch):
+        from backend.services.create_agent_tools import _update_space
+
+        bodies = []
+        self._mock_client(monkeypatch, bodies)
+
+        result = _update_space("space1", display_name="New Name")
+
+        assert result["success"] is True
+        assert "description" not in bodies[0]["body"]
+
+    def test_rename_uses_title_field(self, monkeypatch):
+        """The updateSpace API field for the display name is 'title', not 'display_name' —
+        sending 'display_name' makes the rename a silent no-op."""
+        from backend.services.create_agent_tools import _update_space
+
+        bodies = []
+        self._mock_client(monkeypatch, bodies)
+
+        result = _update_space("space1", display_name="New Name")
+
+        assert result["success"] is True
+        assert bodies[0]["body"]["title"] == "New Name"
+        assert "display_name" not in bodies[0]["body"]
+
+    def test_warehouse_id_omitted_on_metadata_only_update(self, monkeypatch):
+        """A title/description-only PATCH must not carry warehouse_id — that would reset the
+        space's configured warehouse. warehouse_id belongs only with a serialized_space update."""
+        from backend.services.create_agent_tools import _update_space
+
+        bodies = []
+        self._mock_client(monkeypatch, bodies)
+        # Warehouse IS configured — it must still be omitted for a metadata-only update.
+        monkeypatch.setattr("backend.services.create_agent_tools.get_sql_warehouse_id", lambda: "wh123")
+
+        result = _update_space("space1", display_name="New Name", description="Answers revenue questions.")
+
+        assert result["success"] is True
+        assert "warehouse_id" not in bodies[0]["body"]
+        assert "serialized_space" not in bodies[0]["body"]
+
+    def test_error_when_nothing_to_update(self):
+        from backend.services.create_agent_tools import _update_space
+
+        result = _update_space("space1")
+        assert result["success"] is False
+
+
+class TestPresentPlanSuggestedDescription:
+    """_present_plan surfaces suggested_description so the dense-plan path (routed
+    directly through present_plan, not parallel generate_plan) can honor the LLM's
+    intended space description on CREATE."""
+
+    def test_suggested_description_included_when_passed(self):
+        result = _present_plan(
+            tables=[{"identifier": "c.s.t"}],
+            suggested_description="Answers revenue questions for US retail.",
+        )
+        assert result["suggested_description"] == "Answers revenue questions for US retail."
+
+    def test_suggested_description_omitted_when_absent(self):
+        result = _present_plan(tables=[{"identifier": "c.s.t"}])
+        assert "suggested_description" not in result
+
+    def test_suggested_description_omitted_when_empty(self):
+        result = _present_plan(tables=[{"identifier": "c.s.t"}], suggested_description="")
+        assert "suggested_description" not in result
