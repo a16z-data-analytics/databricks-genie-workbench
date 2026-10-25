@@ -2,12 +2,13 @@
 name = "genie-space-optimizer"
 dynamic = ["version"]
 description = "Add your description here"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 dependencies = [
+    "certifi==2026.10.19",
     "databricks-sdk==0.117.0",
-    "mlflow[databricks]==3.11.1",
+    "mlflow[databricks]==3.16.0",
     "openai==2.30.0",
-    "litellm==1.82.6",
+    "litellm==1.88.6",
     "pyyaml==6.0.3",
     "pydantic==2.12.5",
     "pandas==2.3.3",

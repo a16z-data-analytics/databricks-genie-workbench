@@ -204,7 +204,7 @@ if ! (cd "$PROJECT_DIR/frontend" && npm ci && npm run build); then
     echo "      External/customer:  npm config set registry https://registry.npmjs.org/"
     echo "    - Rollup platform binary missing after npm ci"
     echo "      (rm -rf frontend/node_modules && cd frontend && npm ci)"
-    echo "    - Node version too old or unsupported (require ^20.19.0 or >=22.12.0)"
+    echo "    - Node version too old or unsupported (require 22.23.4+, 24.22.1+, or 26.12.1+)"
     exit 1
 fi
 if [ ! -f "$PROJECT_DIR/frontend/dist/index.html" ]; then
