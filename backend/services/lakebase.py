@@ -9,10 +9,13 @@ import asyncio
 import json
 import logging
 import os
+import ssl
 import time
 import uuid
 from datetime import datetime
 from typing import Optional
+
+import certifi
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +43,10 @@ _lakebase_instance_name: str | None = None
 _lakebase_autoscaling_endpoint: str | None = None  # autoscaling endpoint path for credential generation
 _lakebase_project_name: str | None = None  # extracted once from endpoint path for logging
 _conn_params: dict | None = None  # stored at init for pool recreation on token refresh
+
+
+def _lakebase_ssl_context() -> ssl.SSLContext:
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 def _generate_credential() -> tuple[str, str] | None:
@@ -129,7 +136,7 @@ async def _token_refresh_loop():
                 min_size=2,
                 max_size=10,
                 command_timeout=30,
-                ssl="require",
+                ssl=_lakebase_ssl_context(),
             )
             old_pool = _pool
             _pool = new_pool
@@ -392,7 +399,7 @@ async def init_pool():
             max_size=25,
             command_timeout=30,
             timeout=10,
-            ssl="require",
+            ssl=_lakebase_ssl_context(),
         )
         _lakebase_available = True
         logger.info("Lakebase connection pool initialized")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import certifi
+
 from .config import InstallConfig, LakebaseInfo
 
 
@@ -188,7 +190,8 @@ def grant_database_permissions(
             dbname="databricks_postgres",
             user=deployer_user,
             password=token,
-            sslmode="require",
+            sslmode="verify-full",
+            sslrootcert=certifi.where(),
         )
         conn.autocommit = True
         try:
